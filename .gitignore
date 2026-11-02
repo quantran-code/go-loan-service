@@ -1,3 +1,10 @@
+# build output
+/bin/
+/go-api-gateway
+/go-member-service
+/go-catalog-service
+/go-loan-service
+# local databases
 *.db
 *.db-shm
 *.db-wal
