@@ -19,6 +19,9 @@ var (
 	errBookNotFound = errors.New("book not found")
 	// errBookOnLoan means the books service already has the book out.
 	errBookOnLoan = errors.New("book already on loan")
+	// errBookNotOnLoan means the books service answered 409 to a return because the
+	// book was already available.
+	errBookNotOnLoan = errors.New("book not on loan")
 	// errUpstreamUnavailable covers transport failures, timeouts and every status
 	// the clients do not otherwise map.
 	errUpstreamUnavailable = errors.New("upstream unavailable")
@@ -86,6 +89,30 @@ func (b *booksClient) borrow(ctx context.Context, bookID int64) error {
 		return errBookNotFound
 	case http.StatusConflict:
 		return errBookOnLoan
+	default:
+		return errUpstreamUnavailable
+	}
+}
+
+// release performs POST <base>/books/<id>/return. A 200 means the books service put
+// the book back to available, a 404 becomes errBookNotFound and a 409 means the book
+// was already available, which becomes errBookNotOnLoan; any other answer or a
+// transport failure becomes errUpstreamUnavailable.
+func (b *booksClient) release(ctx context.Context, bookID int64) error {
+	if b == nil || b.base == nil || b.http == nil {
+		return errUpstreamUnavailable
+	}
+	status, err := sendUpstream(ctx, b.http, http.MethodPost, b.base.JoinPath("books", strconv.FormatInt(bookID, 10), "return"))
+	if err != nil {
+		return err
+	}
+	switch status {
+	case http.StatusOK:
+		return nil
+	case http.StatusNotFound:
+		return errBookNotFound
+	case http.StatusConflict:
+		return errBookNotOnLoan
 	default:
 		return errUpstreamUnavailable
 	}

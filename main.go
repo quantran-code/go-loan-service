@@ -55,5 +55,6 @@ func NewRouter(cfg Config) http.Handler {
 		newMembersClient(cfg.MembersURL, cfg.UpstreamTimeout),
 		newBooksClient(cfg.BooksURL, cfg.UpstreamTimeout))
 	r.Post("/loans", api.createLoan)
+	r.Post("/loans/{id}/return", api.returnLoan)
 	return r
 }

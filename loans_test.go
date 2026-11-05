@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -55,9 +56,9 @@ func (f *fakeUpstream) served() []upstreamRequest {
 	return append([]upstreamRequest(nil), f.requests...)
 }
 
-// newLoanTestRouter serves POST /loans over the two dependency bases through the same
-// request-ID middleware the service uses, and hands back the API so a test can read
-// the store the loan is recorded in.
+// newLoanTestRouter serves POST /loans and POST /loans/{id}/return over the two
+// dependency bases through the same request-ID middleware the service uses, and hands
+// back the API so a test can read the store the loan is recorded in.
 func newLoanTestRouter(membersBase, booksBase *url.URL) (http.Handler, *loanAPI) {
 	loans := newLoanStore()
 	api := newLoanAPI(loans,
@@ -66,6 +67,7 @@ func newLoanTestRouter(membersBase, booksBase *url.URL) (http.Handler, *loanAPI)
 	r := chi.NewRouter()
 	r.Use(RequestIDMiddleware)
 	r.Post("/loans", api.createLoan)
+	r.Post("/loans/{id}/return", api.returnLoan)
 	return r, api
 }
 
@@ -79,11 +81,132 @@ func postLoan(t *testing.T, router http.Handler, body string) *httptest.Response
 	return rec
 }
 
+// postReturn sends POST path with no body and returns the recorded response.
+func postReturn(t *testing.T, router http.Handler, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
 // storedLoans copies the loans the store currently holds.
 func storedLoans(store *loanStore) []Loan {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return append([]Loan(nil), store.loans...)
+}
+
+func TestReturnLoanMarksItReturned(t *testing.T) {
+	store := newLoanStore()
+	created := store.record(1, 7, time.Date(2024, time.May, 1, 12, 30, 0, 0, time.UTC))
+
+	if created.ReturnedAt != nil {
+		t.Fatalf("record() set ReturnedAt = %s, want nil", created.ReturnedAt)
+	}
+	open, err := json.Marshal(created)
+	if err != nil {
+		t.Fatalf("marshalling loan: %v", err)
+	}
+	if strings.Contains(string(open), "returned_at") {
+		t.Fatalf("json %s carries returned_at on an open loan", open)
+	}
+
+	// One hour ahead of UTC, so the mark proves it is normalised.
+	returnedAt := time.Date(2024, time.May, 3, 9, 15, 0, 0, time.FixedZone("BST", 3600))
+	returned, err := store.returnLoan(created.ID, returnedAt)
+	if err != nil {
+		t.Fatalf("returnLoan() error: %v", err)
+	}
+	want := returnedAt.UTC().Truncate(time.Second)
+	if returned.ReturnedAt == nil {
+		t.Fatalf("ReturnedAt = nil, want %s", want)
+	}
+	if !returned.ReturnedAt.Equal(want) {
+		t.Fatalf("ReturnedAt = %s, want %s", returned.ReturnedAt, want)
+	}
+	if got := returned.ReturnedAt.Location(); got != time.UTC {
+		t.Fatalf("ReturnedAt location = %s, want UTC", got)
+	}
+
+	stored := storedLoans(store)
+	if len(stored) != 1 || stored[0].ReturnedAt == nil || !stored[0].ReturnedAt.Equal(want) {
+		t.Fatalf("stored loans = %+v, want one loan returned at %s", stored, want)
+	}
+
+	body, err := json.Marshal(returned)
+	if err != nil {
+		t.Fatalf("marshalling loan: %v", err)
+	}
+	if !strings.Contains(string(body), `"returned_at":"2024-05-03T08:15:00Z"`) {
+		t.Fatalf("json %s does not carry returned_at in RFC3339", body)
+	}
+}
+
+func TestReturnLoanRejectsAnAlreadyReturnedLoan(t *testing.T) {
+	store := newLoanStore()
+	created := store.record(1, 7, time.Date(2024, time.May, 1, 12, 30, 0, 0, time.UTC))
+	firstReturn := time.Date(2024, time.May, 3, 8, 15, 0, 0, time.UTC)
+
+	if _, err := store.returnLoan(created.ID, firstReturn); err != nil {
+		t.Fatalf("first returnLoan() error: %v", err)
+	}
+
+	if _, err := store.returnLoan(created.ID, firstReturn.Add(48*time.Hour)); !errors.Is(err, errLoanAlreadyReturned) {
+		t.Fatalf("second returnLoan() = %v, want %v", err, errLoanAlreadyReturned)
+	}
+
+	stored := storedLoans(store)
+	if len(stored) != 1 || stored[0].ReturnedAt == nil || !stored[0].ReturnedAt.Equal(firstReturn) {
+		t.Fatalf("stored loans = %+v, want one loan returned at %s", stored, firstReturn)
+	}
+}
+
+func TestReturnLoanRejectsAnUnknownID(t *testing.T) {
+	store := newLoanStore()
+	created := store.record(1, 7, time.Date(2024, time.May, 1, 12, 30, 0, 0, time.UTC))
+
+	returned, err := store.returnLoan(created.ID+1, time.Date(2024, time.May, 3, 8, 15, 0, 0, time.UTC))
+	if !errors.Is(err, errLoanNotFound) {
+		t.Fatalf("returnLoan() = %v, want %v", err, errLoanNotFound)
+	}
+	if returned != (Loan{}) {
+		t.Fatalf("returnLoan() = %+v, want the zero loan", returned)
+	}
+
+	stored := storedLoans(store)
+	if len(stored) != 1 || stored[0].ReturnedAt != nil {
+		t.Fatalf("stored loans = %+v, want one open loan", stored)
+	}
+}
+
+func TestUndoReturnRestoresTheLoan(t *testing.T) {
+	store := newLoanStore()
+	created := store.record(1, 7, time.Date(2024, time.May, 1, 12, 30, 0, 0, time.UTC))
+	returnedAt := time.Date(2024, time.May, 3, 8, 15, 0, 0, time.UTC)
+
+	if _, err := store.returnLoan(created.ID, returnedAt); err != nil {
+		t.Fatalf("returnLoan() error: %v", err)
+	}
+
+	// An unknown id is a no-op, so the marked loan stays as it was.
+	store.undoReturn(created.ID + 1)
+	if stored := storedLoans(store); len(stored) != 1 || stored[0].ReturnedAt == nil {
+		t.Fatalf("stored loans = %+v, want the loan still returned", stored)
+	}
+
+	store.undoReturn(created.ID)
+	if stored := storedLoans(store); len(stored) != 1 || stored[0].ReturnedAt != nil {
+		t.Fatalf("stored loans = %+v, want ReturnedAt cleared", stored)
+	}
+
+	returned, err := store.returnLoan(created.ID, returnedAt)
+	if err != nil {
+		t.Fatalf("returnLoan() after undoReturn error: %v", err)
+	}
+	if returned.ReturnedAt == nil || !returned.ReturnedAt.Equal(returnedAt) {
+		t.Fatalf("ReturnedAt = %v, want %s", returned.ReturnedAt, returnedAt)
+	}
 }
 
 // decodeLoan decodes a loan response body.
@@ -314,5 +437,184 @@ func TestCreateLoanForwardsTheRequestID(t *testing.T) {
 		if got := requests[0].requestID; got != "abc" {
 			t.Fatalf("%s service saw %s = %q, want %q", name, RequestIDHeader, got, "abc")
 		}
+	}
+}
+
+func TestReturnLoanReleasesTheBook(t *testing.T) {
+	members := newFakeUpstream(t, http.StatusOK)
+	books := newFakeUpstream(t, http.StatusOK)
+	router, api := newLoanTestRouter(baseURL(t, members.server), baseURL(t, books.server))
+
+	borrow := postLoan(t, router, `{"book_id":1,"member_id":7}`)
+	if borrow.Code != http.StatusCreated {
+		t.Fatalf("borrow status = %d, want %d; body: %s", borrow.Code, http.StatusCreated, borrow.Body)
+	}
+	created := decodeLoan(t, borrow)
+
+	returnedAt := time.Date(2024, time.May, 3, 8, 15, 0, 0, time.UTC)
+	api.now = func() time.Time { return returnedAt }
+
+	rec := postReturn(t, router, "/loans/1/return")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body)
+	}
+
+	returned := decodeLoan(t, rec)
+	if returned.ID != created.ID {
+		t.Fatalf("id = %d, want %d", returned.ID, created.ID)
+	}
+	if returned.ReturnedAt == nil {
+		t.Fatalf("returned_at = nil, want %s", returnedAt)
+	}
+	if !returned.ReturnedAt.Equal(returnedAt) {
+		t.Fatalf("returned_at = %s, want %s", returned.ReturnedAt, returnedAt)
+	}
+	if got := returned.ReturnedAt.Format(time.RFC3339); got != "2024-05-03T08:15:00Z" {
+		t.Fatalf("returned_at = %s, want 2024-05-03T08:15:00Z", got)
+	}
+
+	stored := storedLoans(api.loans)
+	if len(stored) != 1 || stored[0].ReturnedAt == nil || !stored[0].ReturnedAt.Equal(returnedAt) {
+		t.Fatalf("stored loans = %+v, want one loan returned at %s", stored, returnedAt)
+	}
+
+	bookRequests := books.served()
+	returns := 0
+	for _, request := range bookRequests {
+		if request.path != "/books/1/return" {
+			continue
+		}
+		if request.method != http.MethodPost {
+			t.Fatalf("return request method = %s, want %s", request.method, http.MethodPost)
+		}
+		returns++
+	}
+	if returns != 1 {
+		t.Fatalf("books service saw %+v, want exactly one POST /books/1/return", bookRequests)
+	}
+}
+
+func TestReturnLoanTwiceReturns409(t *testing.T) {
+	members := newFakeUpstream(t, http.StatusOK)
+	books := newFakeUpstream(t, http.StatusOK)
+	router, api := newLoanTestRouter(baseURL(t, members.server), baseURL(t, books.server))
+
+	if rec := postLoan(t, router, `{"book_id":1,"member_id":7}`); rec.Code != http.StatusCreated {
+		t.Fatalf("borrow status = %d, want %d; body: %s", rec.Code, http.StatusCreated, rec.Body)
+	}
+	if rec := postReturn(t, router, "/loans/1/return"); rec.Code != http.StatusOK {
+		t.Fatalf("first return status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body)
+	}
+
+	rec := postReturn(t, router, "/loans/1/return")
+	assertErrorResponse(t, rec, http.StatusConflict, "loan already returned")
+
+	returns := 0
+	for _, request := range books.served() {
+		if request.path == "/books/1/return" {
+			returns++
+		}
+	}
+	if returns != 1 {
+		t.Fatalf("books service saw %d return requests, want 1", returns)
+	}
+
+	stored := storedLoans(api.loans)
+	if len(stored) != 1 || stored[0].ReturnedAt == nil {
+		t.Fatalf("stored loans = %+v, want one returned loan", stored)
+	}
+}
+
+func TestReturnUnknownLoanReturns404(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{name: "unknown id", path: "/loans/999/return"},
+		{name: "non-numeric id", path: "/loans/abc/return"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			members := newFakeUpstream(t, http.StatusOK)
+			books := newFakeUpstream(t, http.StatusOK)
+			router, api := newLoanTestRouter(baseURL(t, members.server), baseURL(t, books.server))
+			api.loans.record(1, 7, time.Date(2024, time.May, 1, 12, 30, 0, 0, time.UTC))
+
+			rec := postReturn(t, router, tc.path)
+			assertErrorResponse(t, rec, http.StatusNotFound, "loan not found")
+
+			if got := books.served(); len(got) != 0 {
+				t.Fatalf("books service saw %+v, want no request", got)
+			}
+			stored := storedLoans(api.loans)
+			if len(stored) != 1 || stored[0].ReturnedAt != nil {
+				t.Fatalf("stored loans = %+v, want one open loan", stored)
+			}
+		})
+	}
+}
+
+func TestReturnLoanMapsBooksErrors(t *testing.T) {
+	cases := []struct {
+		name        string
+		booksStatus int
+		unreachable bool
+		status      int
+		want        string
+	}{
+		{name: "book not found", booksStatus: http.StatusNotFound, status: http.StatusNotFound, want: "book not found"},
+		{name: "book already available", booksStatus: http.StatusConflict, status: http.StatusConflict, want: "book not on loan"},
+		{name: "books 500", booksStatus: http.StatusInternalServerError, status: http.StatusBadGateway, want: "upstream unavailable"},
+		{name: "books unreachable", unreachable: true, status: http.StatusBadGateway, want: "upstream unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			members := newFakeUpstream(t, http.StatusOK)
+			books := newFakeUpstream(t, tc.booksStatus)
+			booksBase := baseURL(t, books.server)
+			if tc.unreachable {
+				books.server.Close()
+			}
+			router, api := newLoanTestRouter(baseURL(t, members.server), booksBase)
+
+			// The loan is seeded directly: the borrow call would answer with the same
+			// status the return call has to map.
+			api.loans.record(1, 7, time.Date(2024, time.May, 1, 12, 30, 0, 0, time.UTC))
+
+			rec := postReturn(t, router, "/loans/1/return")
+			assertErrorResponse(t, rec, tc.status, tc.want)
+
+			stored := storedLoans(api.loans)
+			if len(stored) != 1 || stored[0].ReturnedAt != nil {
+				t.Fatalf("stored loans = %+v, want one open loan", stored)
+			}
+		})
+	}
+}
+
+func TestReturnLoanForwardsTheRequestID(t *testing.T) {
+	members := newFakeUpstream(t, http.StatusOK)
+	books := newFakeUpstream(t, http.StatusOK)
+	router, api := newLoanTestRouter(baseURL(t, members.server), baseURL(t, books.server))
+	api.loans.record(1, 7, time.Date(2024, time.May, 1, 12, 30, 0, 0, time.UTC))
+
+	req := httptest.NewRequest(http.MethodPost, "/loans/1/return", nil)
+	req.Header.Set(RequestIDHeader, "abc")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body)
+	}
+
+	requests := books.served()
+	if len(requests) != 1 {
+		t.Fatalf("books service saw %d requests, want 1", len(requests))
+	}
+	if requests[0].method != http.MethodPost || requests[0].path != "/books/1/return" {
+		t.Fatalf("books service saw %+v, want POST /books/1/return", requests[0])
+	}
+	if got := requests[0].requestID; got != "abc" {
+		t.Fatalf("books service saw %s = %q, want %q", RequestIDHeader, got, "abc")
 	}
 }

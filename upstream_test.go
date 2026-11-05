@@ -100,6 +100,89 @@ func TestBooksClientMapsStatus(t *testing.T) {
 	}
 }
 
+func TestBooksClientReleaseMapsStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		serve  bool
+		want   error
+	}{
+		{name: "200", status: http.StatusOK, serve: true, want: nil},
+		{name: "404", status: http.StatusNotFound, serve: true, want: errBookNotFound},
+		{name: "409", status: http.StatusConflict, serve: true, want: errBookNotOnLoan},
+		{name: "500", status: http.StatusInternalServerError, serve: true, want: errUpstreamUnavailable},
+		{name: "unreachable", serve: false, want: errUpstreamUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %s, want %s", r.Method, http.MethodPost)
+				}
+				if r.URL.Path != "/books/3/return" {
+					t.Errorf("path = %s, want /books/3/return", r.URL.Path)
+				}
+				w.WriteHeader(tc.status)
+			}))
+			base := baseURL(t, server)
+			if tc.serve {
+				defer server.Close()
+			} else {
+				server.Close()
+			}
+
+			client := newBooksClient(base, upstreamTimeout)
+			if got := client.release(context.Background(), 3); got != tc.want {
+				t.Fatalf("release() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("forwards the request id", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			seen = r.Header.Get(RequestIDHeader)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		ctx := context.WithValue(context.Background(), requestIDKey{}, "abc")
+		if err := newBooksClient(baseURL(t, server), upstreamTimeout).release(ctx, 3); err != nil {
+			t.Fatalf("release() = %v, want nil", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if seen != "abc" {
+			t.Fatalf("books service saw %s = %q, want %q", RequestIDHeader, seen, "abc")
+		}
+	})
+
+	t.Run("nil client", func(t *testing.T) {
+		var client *booksClient
+		if got := client.release(context.Background(), 3); got != errUpstreamUnavailable {
+			t.Fatalf("release() = %v, want %v", got, errUpstreamUnavailable)
+		}
+	})
+
+	t.Run("nil base", func(t *testing.T) {
+		client := newBooksClient(nil, upstreamTimeout)
+		if got := client.release(context.Background(), 3); got != errUpstreamUnavailable {
+			t.Fatalf("release() = %v, want %v", got, errUpstreamUnavailable)
+		}
+	})
+
+	t.Run("nil http client", func(t *testing.T) {
+		client := &booksClient{base: &url.URL{Scheme: "http", Host: "books"}}
+		if got := client.release(context.Background(), 3); got != errUpstreamUnavailable {
+			t.Fatalf("release() = %v, want %v", got, errUpstreamUnavailable)
+		}
+	})
+}
+
 func TestClientsForwardTheRequestID(t *testing.T) {
 	var mu sync.Mutex
 	var seen []string
