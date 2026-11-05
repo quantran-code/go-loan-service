@@ -26,7 +26,7 @@ func TestRequestsAreLoggedWithTheRequestID(t *testing.T) {
 	req.Header.Set(RequestIDHeader, "abc")
 	rec := httptest.NewRecorder()
 
-	NewRouter().ServeHTTP(rec, req)
+	NewRouter(Config{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
@@ -47,7 +47,7 @@ func TestRequestsWithoutRequestIDAreStillServedAndLogged(t *testing.T) {
 	buf := captureLog(t)
 
 	rec := httptest.NewRecorder()
-	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	NewRouter(Config{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
